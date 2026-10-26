@@ -23,14 +23,33 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
         'QWEN38_EC_ELASTIC_GB': '6', 'QWEN38_EC_RESERVE_GB': '1.7',
         'QWEN38_NV_COPY_GRID': '24', 'QWEN38_EC_COPY_GRID': '24',
         'EXL3_NGRAM_STREAM': '1', 'QWEN_VRAM_LIMIT_BYTES': '16000000000',
-        'MAX_JOBS': '4', 'TORCH_CUDA_ARCH_LIST': '8.9',
+        'MAX_JOBS': '4',
     }
     for k,v in env.items(): os.environ.setdefault(k,v)
     torch.set_num_threads(1)
     torch.cuda.init()
+    # TORCH_CUDA_ARCH_LIST defaulted to '8.9' (Ada / RTX 4090), the card the upstream README was
+    # benchmarked on. On any other architecture (e.g. sm_86 / Ampere, RTX 3060/3090) the compiled
+    # kernels would be missing for this device and fail at first launch ("no kernel image
+    # available"). Derive it from the actual GPU instead of assuming 4090-class hardware.
+    if 'TORCH_CUDA_ARCH_LIST' not in os.environ:
+        major, minor = torch.cuda.get_device_capability()
+        os.environ['TORCH_CUDA_ARCH_LIST'] = f'{major}.{minor}'
     _, total = torch.cuda.mem_get_info()
-    # Leave room for CUDA context and non-PyTorch allocations as well as allocator fragmentation.
-    torch.cuda.set_per_process_memory_fraction(15_000_000_000 / total)
+    # Original hardcoded a 15 GB numerator, implicitly assuming a >=16 GB card. On a smaller or
+    # desktop-shared (WDDM) card that fraction can exceed 1.0, which torch rejects outright
+    # (ValueError) before anything else runs. Derive the budget from what's actually free right
+    # now (so it accounts for VRAM already held by the desktop compositor / other GPU clients),
+    # minus headroom for the CUDA context, allocator fragmentation, and fluctuation in whatever
+    # else is sharing the GPU. Clamp into (0, 1] so this never raises regardless of card size.
+    free, _ = torch.cuda.mem_get_info()
+    headroom = max(1_500_000_000, int(total * 0.12))
+    budget = max(0, min(free, total) - headroom)
+    fraction = max(0.05, min(0.97, budget / total))
+    torch.cuda.set_per_process_memory_fraction(fraction)
+    print(f'QWEN_VRAM_BUDGET total={total/1e9:.2f}GB free={free/1e9:.2f}GB '
+          f'headroom={headroom/1e9:.2f}GB fraction={fraction:.3f} '
+          f"arch={os.environ['TORCH_CUDA_ARCH_LIST']}", flush=True)
     if os.environ.get('QWEN_EXL3_SOURCE')=='1':
         sys.path.insert(0,str(ROOT/'exllamav3'))
     from exllamav3 import model_init

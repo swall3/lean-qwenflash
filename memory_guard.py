@@ -29,7 +29,13 @@ class HostMemory:
 class DeviceMemory:
     class Info(C.Structure):
         _fields_=[('total',C.c_ulonglong),('free',C.c_ulonglong),('used',C.c_ulonglong)]
-    def __init__(self,limit=16_000_000_000):
+    def __init__(self,limit=None):
+        # Default was a hardcoded 16 GB, which never binds on a card smaller than that (e.g. a
+        # 12 GB RTX 3060): NVML reports whole-device usage under WDDM, so on a sub-16GB card the
+        # watchdog would simply never fire before a real CUDA OOM. Read QWEN_VRAM_LIMIT_BYTES so
+        # this stays consistent with the budget qwen_offload.py actually configured.
+        if limit is None:
+            limit=int(os.environ.get('QWEN_VRAM_LIMIT_BYTES','16000000000'))
         self.lib=C.CDLL('libnvidia-ml.so.1')
         assert self.lib.nvmlInit_v2()==0
         self.handle=C.c_void_p()
