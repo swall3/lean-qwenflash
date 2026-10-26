@@ -47,18 +47,33 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
     budget = max(0, min(free, total) - headroom)
     # Also bound by the whole-device watchdog (memory_guard.DeviceMemory, QWEN_VRAM_LIMIT_BYTES):
     # NVML/the watchdog see device-wide usage, so what matters is (already-used + this budget),
-    # not this budget alone. Without this, the two caps can land within a few hundred MB of each
-    # other -- any non-torch allocation (CUDA context growth, another app's VRAM use ticking up)
-    # then trips the watchdog's os._exit(86) even though torch itself stayed under its fraction.
+    # not this budget alone. Measured back-to-back on this machine: torch.cuda.mem_get_info()
+    # reported used=1.09GB while NVML's nvmlDeviceGetMemoryInfo() reported used=2.73GB at the
+    # SAME instant -- a 1.64GB WDDM accounting gap between the two APIs. Using torch's optimistic
+    # number here would undercount by that much and let real (NVML-visible) usage sail past the
+    # watchdog. Query NVML directly for the "already used" baseline instead of trusting torch's.
+    try:
+        import ctypes as _C
+        class _NvmlInfo(_C.Structure):
+            _fields_=[('total',_C.c_ulonglong),('free',_C.c_ulonglong),('used',_C.c_ulonglong)]
+        _nvml=_C.CDLL('libnvidia-ml.so.1')
+        _nvml.nvmlInit_v2()
+        _h=_C.c_void_p(); _nvml.nvmlDeviceGetHandleByIndex_v2(0,_C.byref(_h))
+        _info=_NvmlInfo(); _nvml.nvmlDeviceGetMemoryInfo(_h,_C.byref(_info))
+        used_now = max(total - free, _info.used)
+    except Exception as _e:
+        print(f'QWEN_VRAM_BUDGET: NVML query failed ({_e}), falling back to torch-only '
+              f'accounting (may undercount real usage under WDDM)', flush=True)
+        used_now = total - free
     vram_limit = int(os.environ.get('QWEN_VRAM_LIMIT_BYTES', '16000000000'))
     watchdog_margin = 500_000_000
-    used_now = total - free
     budget = max(0, min(budget, vram_limit - used_now - watchdog_margin))
     fraction = max(0.05, min(0.97, budget / total))
     torch.cuda.set_per_process_memory_fraction(fraction)
-    print(f'QWEN_VRAM_BUDGET total={total/1e9:.2f}GB free={free/1e9:.2f}GB '
-          f'headroom={headroom/1e9:.2f}GB vram_limit={vram_limit/1e9:.2f}GB '
-          f'fraction={fraction:.3f} arch={os.environ["TORCH_CUDA_ARCH_LIST"]}', flush=True)
+    print(f'QWEN_VRAM_BUDGET total={total/1e9:.2f}GB torch_free={free/1e9:.2f}GB '
+          f'nvml_used_now={used_now/1e9:.2f}GB headroom={headroom/1e9:.2f}GB '
+          f'vram_limit={vram_limit/1e9:.2f}GB fraction={fraction:.3f} '
+          f'arch={os.environ["TORCH_CUDA_ARCH_LIST"]}', flush=True)
     if os.environ.get('QWEN_EXL3_SOURCE')=='1':
         sys.path.insert(0,str(ROOT/'exllamav3'))
     from exllamav3 import model_init

@@ -3,168 +3,178 @@
 Status as of 2026-10-26: **code fixes verified in isolation; full end-to-end load NOT attempted**
 (the 85 GB model isn't downloaded and the store isn't packed yet -- see "Blocked" below).
 Nothing here is a claim that this works on 12 GB. It's the groundwork plus an honest list of
-what's still unknown.
+what's still unknown, including findings that make the honest VRAM budget *smaller* than first
+estimated.
 
 ## What was fixed (verified against the real hardware)
 
 Upstream (`MaxDevv/lean-qwenflash`) was built and benchmarked on an RTX 4090 intentionally capped
-to 16 GB. Two of its hardcoded assumptions break outright on a smaller/different card:
+to 16 GB. Several of its hardcoded assumptions break on different hardware:
 
 1. **`qwen_offload.py`: `torch.cuda.set_per_process_memory_fraction(15_000_000_000 / total)`**
    On a 12,288 MiB (12.88 GB decimal) card this fraction is ~1.16, and PyTorch raises `ValueError`
    for any fraction > 1 -- this crashed before anything else ran. Replaced with a budget derived
-   from `torch.cuda.mem_get_info()` at call time (so it accounts for whatever the desktop
-   compositor / other GPU clients already hold), minus headroom, clamped to `(0.05, 0.97]`.
-   Tested standalone against the real GPU: `total=12.88GB free=11.79GB headroom=1.55GB
-   fraction=0.795` -- no exception.
+   from real VRAM state at call time, clamped to `(0.05, 0.97]`.
 
-2. **`qwen_offload.py`: `TORCH_CUDA_ARCH_LIST` defaulted to `'8.9'`** (Ada / RTX 4090). On any
-   other architecture the compiled kernels are missing for the device and fail at first kernel
-   launch. Now derived from `torch.cuda.get_device_capability()`. Tested standalone: RTX 3060 ->
-   `capability=(8, 6)` -> `TORCH_CUDA_ARCH_LIST=8.6`, which matches the value the project's own
-   vendored GLM-lineage benchmark script (`qwen38-flash-offload/results/.../p003_ab.sh`) already
-   uses for Ampere.
+2. **`TORCH_CUDA_ARCH_LIST` defaulted to `'8.9'`** (Ada / RTX 4090 only). On any other
+   architecture the compiled kernels are missing for the device and fail at first kernel launch
+   ("no kernel image available"). Now derived from `torch.cuda.get_device_capability()`. Also
+   matters at **build** time (`scripts/install.sh`, `pip install -e exllamav3` both read this env
+   var when compiling, not just at runtime) -- `profiles/rtx3060-12gb.env` now exports
+   `TORCH_CUDA_ARCH_LIST=8.6` explicitly so it's set before building, not only before serving.
+   Tested standalone: RTX 3060 -> `capability=(8, 6)` -> `8.6`, matching the value the project's
+   own vendored benchmark script already uses for Ampere.
 
-3. **`memory_guard.py`: `DeviceMemory` hardcoded its watchdog limit to 16 GB**, so on a card
-   smaller than 16 GB the watchdog would never fire before a real CUDA OOM (NVML reports
-   whole-device usage under WDDM, so this was never going to be "our process's" 16 GB anyway).
-   Now reads `QWEN_VRAM_LIMIT_BYTES`, consistent with what `qwen_offload.py` actually configures.
-   **Also fixed:** the torch fraction budget (#1) and this watchdog were computed independently
-   and could land within ~0.17 GB of each other -- any non-torch VRAM growth (CUDA context,
-   another app) would then trip `os._exit(86)` even though torch stayed under its own cap. The
-   torch budget is now also bounded by `QWEN_VRAM_LIMIT_BYTES - already_used - 0.5GB` margin.
-   Verified: with `QWEN_VRAM_LIMIT_BYTES=11.5GB`, the real RTX 3060 now computes
-   `fraction=0.769` (projected device usage 11.0 GB, a full 0.5 GB under the 11.5 GB watchdog),
-   vs. the unbounded version's 0.17 GB margin before this fix.
+3. **`memory_guard.py`: `DeviceMemory` hardcoded its watchdog limit to 16 GB** -- on a smaller
+   card the watchdog would never fire before a real CUDA OOM. Now reads `QWEN_VRAM_LIMIT_BYTES`.
 
-4. **`memory_guard.py: HostMemory` requires a cgroup with a real `memory.max` and
-   `memory.swap.max == 0`.** Neither holds in a plain WSL2 shell on this machine (root cgroup is
-   uncapped; `.wslconfig` sets `swap=16GB`). Added `scripts/run_capped.sh` + `_run_capped_inner.sh`:
-   a `systemd-run --user --scope -p MemoryMax=... -p MemorySwapMax=0` wrapper that resolves its
-   own cgroup path at runtime and exports `QWEN_GLOBAL_MEMORY_CGROUP` / `QWEN_RAM_LIMIT_BYTES`
-   correctly (reading the limit back from the cgroup's actual `memory.max`, not recomputed
-   separately -- an earlier draft had a binary-GiB vs decimal-GB unit mismatch that failed the
-   same assert it was trying to satisfy). **Verified end-to-end** with a real `HostMemory(...)`
-   construction inside the wrapper: `limit=2147483648 current=6737920`, closed cleanly.
+4. **The torch budget and the NVML-based watchdog disagree on "how much is already used," and
+   the gap is real and large.** Measured back-to-back in one process on this machine:
+   `torch.cuda.mem_get_info()` reported `used=1.09GB` while `nvmlDeviceGetMemoryInfo()` reported
+   `used=2.73GB` **at the same instant** -- a 1.64 GB WDDM accounting gap between the two APIs.
+   An earlier draft of this fix used torch's optimistic number to keep the torch budget clear of
+   the watchdog; that would have let real (NVML-visible) usage sail past the watchdog on the
+   first load. Fixed: `qwen_offload.py` now queries NVML directly for the "already used" baseline
+   (same calc the watchdog itself uses), with a 0.5 GB margin.
+   **Net effect: the real usable budget is smaller than first estimated.** With this profile's
+   `QWEN_VRAM_LIMIT_BYTES=11.5GB`, the corrected calculation gives a torch fraction budget of only
+   **~8.3 GB**, not the ~10 GB a torch-only calculation would have suggested. That ~8.3 GB is what
+   the dense model + KV cache + minimal expert-slot pool actually have to fit inside.
+
+5. **`memory_guard.py: HostMemory` requires a cgroup with a real `memory.max` and
+   `memory.swap.max == 0`**, which a plain WSL2 shell here doesn't have (root cgroup is uncapped;
+   `.wslconfig` sets `swap=16GB`). Added `scripts/run_capped.sh` + `_run_capped_inner.sh`: a
+   `systemd-run --user --scope` wrapper that resolves its own cgroup path at runtime (split into
+   two files because systemd-run does its own `$VAR` expansion on inline command text, silently
+   emptying variables in an inline string) and reads the watchdog limit back from the cgroup's
+   actual `memory.max` rather than recomputing it (an earlier draft had a binary-GiB vs
+   decimal-GB mismatch that failed the very assert it was trying to satisfy). **Verified
+   end-to-end**: a real `HostMemory(...)` construction succeeds inside it.
+   The usage example (here and in the profile) is `run_capped.sh 20 ... --ram-gb 8`, not
+   `9 ... --ram-gb 9` -- `--ram-gb` sizes only the expert RAM cache; python/torch/CUDA/staging
+   need headroom on top (the README's own 3080-laptop row needed 19-24 GB system RAM for an 8 GB
+   cache).
+
+**Pinned host memory under WSL2: tested with the engine's actual mechanism, not a blocker.**
+`nv_tier.py`/`nv2.py` pin host memory via anonymous `mmap` + `cudaHostRegister(..., 2)`
+(`cudaHostRegisterMapped`), not `cudaHostAlloc` -- checked by grepping the native sources for
+`io_uring`/`liburing`/`mlock`/`RLIMIT` (none found) and then reproducing the exact call pattern:
+inside `run_capped.sh 20 --`, `mmap.mmap(-1, n)` + `cudaHostRegister(addr, n, 2)` succeeded at
+2 GB, 4 GB, and 8 GB despite `ulimit -l` (soft and hard) being only 64 MB -- CUDA-on-WSL's pinning
+path doesn't go through Linux's native `RLIMIT_MEMLOCK` accounting here. WSL2 itself is not the
+blocker.
+
+**Two of the three README quickstart steps don't work as written** (this repo is 2 days old;
+take the README with real caution):
+- `python compile_local.py` (step 2) refers to a file that isn't in the repo -- confirmed by
+  `find` turning up nothing, and by upstream's own open issue filed the same day:
+  `MaxDevv/lean-qwenflash#1 "No compile_local.py in repo"`. The real build path is
+  `qwen38-flash-offload/scripts/install.sh` (needs `nvcc` + `ninja`, JIT-compiles each extension
+  via `torch.utils.cpp_extension.load()`). **Do not set `QWEN_PREBUILT_EXT=1`** -- that opt-in
+  path loads prebuilt `.so` files built for the author's torch ABI and `sm_89` (4090); using them
+  here would be a silent ABI/arch mismatch, not a shortcut.
+- `python download_http.py --model-dir ./model` (step 3) **does not accept `--model-dir` at
+  all** -- the script has no `argparse`. Reading the actual source: it's hardcoded for the
+  author's own Colab-style remote VM (`base=Path(os.environ.get('QWEN_WORK_ROOT',
+  '/content/qwen-opt'))`), joins a specific cgroup by default
+  (`QWEN_DOWNLOAD_JOIN_CGROUP=1` -> writes to `/sys/fs/cgroup/qwen-download/cgroup.procs`, which
+  won't exist on this machine unless created first), and opens its destination files with
+  `os.O_DIRECT` -- meaning its destination must *already* be a native O_DIRECT filesystem, not
+  drvfs, from the very first byte of the download. This fully explains upstream issue #2,
+  *"Access to unexpected repository: /content/qwen-opt/model"* -- another user hit the exact same
+  hardcoded path. Plan to set `QWEN_WORK_ROOT` to wherever the native ext4 volume ends up mounted,
+  and either pre-create `/sys/fs/cgroup/qwen-download` or set `QWEN_DOWNLOAD_JOIN_CGROUP=0`. A
+  plain `hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.05bpw_h5_ng5 --local-dir
+  <path>` (mentioned in the vendored SKILL.md for the GLM-lineage engine) is a simpler, documented
+  alternative if `download_http.py`'s extra speed isn't needed.
 
 Added `profiles/rtx3060-12gb.env`: a conservative first-run config (elastic/staging cache off,
-small `--cache 16384` context, `QWEN38_EC_MAX_SLOTS=256`, `QWEN_VRAM_LIMIT_BYTES=11.5GB`) to try
-before touching any of the richer cache-tuning knobs, per the vendored engine's own
-`qwen38-offload-setup/SKILL.md` ("tune one setting at a time against a control"). The
-`run_capped.sh` example in that file now passes a *larger* `MemoryMax` than `--ram-gb`
-(`run_capped.sh 20 ... --ram-gb 8`, not `9 ... --ram-gb 9`): `--ram-gb` sizes only the expert RAM
-cache, while the cgroup also has to hold Python, torch, the CUDA host runtime, and the pinned
-staging rings -- the README's own 3080-laptop row needed 19-24 GB of system RAM for an 8 GB cache.
-
-**Pinned host memory under WSL2: tested, not a blocker.** The RAM tier and NVMe->GPU staging both
-depend on multi-GB pinned (`cudaHostAlloc`) buffers, and CUDA-on-WSL's documented limitations
-include restricted pinned memory in some configurations, so this was checked directly rather than
-assumed: inside `run_capped.sh 20 --`, `torch.empty(n, dtype=torch.uint8, pin_memory=True)`
-succeeded at 2 GB, 4 GB, and 8 GB (1.78s / 3.49s / 7.03s respectively) with no error. WSL2 itself
-is not the blocker here.
-
-**The README's build step doesn't exist.** `python compile_local.py` (README step 2) refers to a
-file that isn't in the repo -- confirmed by `find` turning up nothing, and by upstream's own open
-issue, filed the same day: `MaxDevv/lean-qwenflash#1 "No compile_local.py in repo"`. The real
-build path is `qwen38-flash-offload/scripts/install.sh`: it needs `nvcc` + `ninja` (no GPU needed
-to build) and JIT-compiles each native extension via `torch.utils.cpp_extension.load()` through
-every module's own lazy `_EXT` loader (`expert_cache._ext()`, `nv_tier._ext()`, `nv2.ext()`,
-`cpu_tier._build()`, `k_hcfuse.ext()`, the fast-split kernel). **Do not set `QWEN_PREBUILT_EXT=1`**
--- `qwen_offload.py` has an opt-in path that loads prebuilt `.so` files from
-`qwen38-flash-offload/build/`, but those were built for the author's torch ABI and `sm_89`
-(4090); loading them here would be silent ABI/arch mismatch, not a working shortcut.
+`QWEN38_EC_MAX_SLOTS=256`, `--cache 16384`, `QWEN_VRAM_LIMIT_BYTES=11.5GB`,
+`TORCH_CUDA_ARCH_LIST=8.6`) to try before touching any richer cache-tuning knobs, per the vendored
+engine's own `qwen38-offload-setup/SKILL.md` ("tune one setting at a time against a control").
 
 ## What's still unverified
 
-- **Whether the dense (non-expert) model fits at all.** The HF revision `3.05bpw_h5_ng5` totals
-  **85.14 GB** across 25 files (confirmed via the HF tree API, read-only, nothing downloaded) --
-  this matches the top-level README's "~85 GB", not the vendored SKILL.md's "125.3 GB" (that
-  number is from the GLM-lineage doc and doesn't apply here). Of that, `ngram_embedding.safetensors`
-  (32.64 GB) streams from disk per the README and the 7 model shards total ~52.35 GB. The README
+- **Whether the dense (non-expert) model fits at all, and now against a smaller real budget.**
+  The HF revision `3.05bpw_h5_ng5` totals **85.14 GB** across 25 files (confirmed via the HF tree
+  API, read-only, nothing downloaded) -- matching the top-level README's "~85 GB", not the
+  vendored SKILL.md's "125.3 GB" (that number is from the unrelated GLM-lineage doc). Of that,
+  `ngram_embedding.safetensors` is 32.64 GB and the 7 model shards total ~52.35 GB. The README
   says the packed *expert* store alone is ~47 GB, which would put the *dense* (non-expert) part
-  at roughly **52.35 - 47 ≈ 5.3 GB** -- an estimate from subtraction, not a measurement. If the
-  real dense footprint plus KV cache plus framework overhead exceeds the ~9-10 GB actually free
-  on this card (12.88 GB total, minus ~1-3 GB already held by the desktop compositor and whatever
-  else is running, minus CUDA context), **no amount of tuning fixes that** -- it's a hard capacity
-  question that can only be answered by actually loading the model.
-- **Whether `QWEN38_EC_MAX_SLOTS=256` and the other `profiles/rtx3060-12gb.env` values are even
-  in the right range.** They're derived from the engine's own formulas and the upstream SKILL.md's
-  "keep EC_MAX_SLOTS=1376 on a desktop-shared GPU" note (scaled down for 12 GB vs. that note's
-  24 GB target), not from a measurement on this card.
+  at roughly **52.35 - 47 ≈ 5.3 GB** -- an estimate from subtraction, not a measurement. Against
+  the corrected **~8.3 GB** real VRAM budget (see fix #4 above), that leaves only ~3 GB for KV
+  cache + framework overhead + any expert-slot pool at all. Plausible, not comfortable, and **no
+  amount of tuning fixes it if the real number is higher** -- it's a hard capacity question only
+  the actual model load can answer.
+- Whether `QWEN38_EC_MAX_SLOTS=256` and the rest of `profiles/rtx3060-12gb.env` are even in the
+  right range -- derived from formulas and the upstream SKILL.md's desktop-GPU note (scaled down
+  from its 24 GB target), not from a measurement on this card.
 - Host RAM available for `--ram-gb` hasn't been re-checked against whatever else is running right
-  now (`.wslconfig` caps the whole WSL VM at `memory=40GB`; that's a ceiling, not a guarantee of
-  headroom).
+  now (`.wslconfig` caps the whole WSL VM at `memory=40GB`; that's a ceiling, not a guarantee).
 
-## Blocked: where does ~90-130 GB of data actually live?
+## Blocked: where does ~130+ GB of data actually live?
 
 Checked before downloading anything:
 
 - **C: drive has only 45 GB free** (96% full). The WSL2 root filesystem (`ext4.vhdx`) already
   consumes **177 GB** on C:, and WSL reports its own virtual filesystem as "813 GB available" --
   that number is **not real headroom**; the vhdx is a dynamically-growing file on the actual,
-  nearly-full C: drive. Writing the model/store into the default WSL root risks filling C:
-  entirely. Do not do this.
-- **D: drive (SK hynix PC801 NVMe) has 237 GB free**, but it's mounted via `drvfs` (`/mnt/d`),
-  which the project's own setup guidance explicitly excludes for the store ("Not suitable: ...
-  network filesystems, FUSE" -- `drvfs` has the same O_DIRECT-reliability problem). **Correction
-  to an earlier draft of this note:** D: is NOT fine for the model directory either, only for the
-  initial download before it's moved. `qwen_offload.py` passes `embed_disk=True` and sets
-  `EXL3_NGRAM_STREAM=1`; the `assert ... mode == 'trellis_disk'` means the 32.64 GB
-  `ngram_embedding.safetensors` streams directly from wherever `--model` points **during every
-  request**, not just once at load. So both `--model` and `--store` need to sit on the same
-  native O_DIRECT-capable ext4, not just the packed store -- roughly 85 GB (model, including the
-  n-gram file) + 47 GB (store) if both are kept side by side, or ~52 GB if the model dir is
-  trimmed to just the shards actually needed post-packing. Either way, that's more than D:'s 237
-  GB would need to worry about as a ceiling, but it rules out leaving the model on `/mnt/d` long
-  term.
+  nearly-full C: drive. Do not write the model/store into the default WSL root.
+- **D: drive (SK hynix PC801 NVMe) has 237 GB free**, mounted via `drvfs` (`/mnt/d`), which the
+  project's own setup guidance excludes for the store (O_DIRECT reliability). This also rules out
+  staging the *model* directory there long-term, not just the store: `qwen_offload.py` sets
+  `EXL3_NGRAM_STREAM=1` and asserts `mode == 'trellis_disk'`, meaning the 32.64 GB
+  `ngram_embedding.safetensors` streams directly from wherever `--model` points **on every
+  request**, not once at load. And `download_http.py` opens its destination with `os.O_DIRECT`
+  from the first byte (see above) -- it can't even write to `/mnt/d` as-is.
+- **Real total footprint, corrected:** model (85 GB, including the n-gram file that has to stay)
+  + store (47 GB) side by side = **~132 GB**, and the pack step's own peak (reads the ~52 GB of
+  shards, writes 47 GB) adds to that while packing runs, not after. A fixed-size VHDX should be
+  sized at **~150-160 GB**, not ~132, for working room. Downloading 85 GB onto D: as a staging
+  step and *then* creating a 150-160 GB VHDX on the same drive needs close to all of D:'s 237 GB
+  free -- tight, not comfortable. Better to download straight into the final native-ext4 volume
+  once it exists, skipping the D: staging step entirely.
 - **Only two physical NVMes currently show up in Windows** (`Get-PhysicalDisk`): the Intel
-  `SSDPEKNW010T8` (C:, and notably a QLC Gen3 drive, ~1.8 GB/s class -- below the project's
-  3+ GB/s floor even if it had space) and the SK hynix `PC801` (D:). **The "spare NVMe drive" is
-  not currently attached to this machine.** Getting real O_DIRECT performance means installing it
-  and attaching it to WSL2 as a raw block device (`wsl --mount --bare`), then formatting it
-  **inside WSL** as ext4 -- not through a Windows drive letter. That's the setup the original
-  request ("I have a spare NVMe drive") was already pointing at; it just isn't installed yet.
+  `SSDPEKNW010T8` (C:, a QLC Gen3 drive, ~1.8 GB/s class -- below the project's 3+ GB/s floor even
+  if it had space) and the SK hynix `PC801` (D:, Gen4). **The "spare NVMe drive" is not currently
+  attached to this machine** -- no free slot confirmed either.
 
-## Environment gaps (not yet addressed, need a decision first)
+## Recommended disk route: fixed-size VHDX on D:, not the spare NVMe (for now)
 
-- Python here is 3.14.4; the README wants 3.10-3.12. Needs a venv (e.g. via `uv`).
-- `nvcc` / CUDA toolkit isn't installed in this WSL distro (the real build step,
-  `qwen38-flash-offload/scripts/install.sh`, needs it). This needs `apt` + sudo. **Correction to
-  an earlier draft of this note:** the toolkit major version must match whatever torch build goes
-  into the venv, not be guessed independently. The torch already present on this machine is
-  `2.13.0+cu130` (driver 616.56 supports it), and `torch.utils.cpp_extension` refuses to build
-  when `nvcc`'s CUDA major version differs from torch's -- so this points at
-  `cuda-toolkit-13-0`, not `12-x`, *if* the venv ends up using the same cu130 wheel. Confirm the
-  target torch version before installing the toolkit. Never install the `cuda` meta-package or
-  any in-WSL `nvidia-driver-*` package -- those break GPU passthrough.
-- Anything that defaults to `~/.cache` (notably `huggingface_hub`'s default cache) lands on C:,
-  which has ~45 GB of real free space. Point `HF_HOME` (and `download_http.py --model-dir`) at
-  whichever volume ends up hosting the model, not the default.
+Two real options; recommending one:
 
-## Three possible disk routes (none set up yet)
+- **Recommended: a fixed-size VHDX file on D:**, created with `diskpart`, attached via
+  `wsl --mount --vhd` (confirm exact flags with `wsl --help` on this WSL 2.7.3.0 before running
+  anything), then `mkfs.ext4` run **inside WSL** on the attached block device. No hardware
+  install, and D: (PC801, Gen4) outperforms the Intel 660p on C: anyway. O_DIRECT throughput
+  through this path is unmeasured -- probe with `dd oflag=direct`/`iflag=direct` before trusting
+  it for the real store.
+- **Alternative: install the spare NVMe**, attach raw (`wsl --mount --bare`), format ext4 inside
+  WSL. Needs a free M.2 slot (not yet confirmed) and a physical install, but gets a real
+  dedicated drive instead of a virtual disk layered on D:'s filesystem.
 
-1. **Install the spare NVMe, attach it to WSL2 raw** (`wsl --mount --bare`), format ext4 inside
-   WSL. The original ask. Needs a free M.2 slot and a physical install.
-2. **A fixed-size VHDX on D:**, created with `diskpart`, attached with `wsl --mount --vhd` (check
-   exact flags via `wsl --help` on this WSL version, 2.7.3.0), then `mkfs.ext4` inside WSL. No
-   hardware install needed, and D: (PC801, Gen4) is a faster drive than the Intel 660p on C:
-   anyway. O_DIRECT throughput through this path is unmeasured -- probe it with `dd oflag=direct`
-   (write) and `iflag=direct` (read) before trusting it for the real store.
-3. Do nothing extra and accept `/mnt/d`'s drvfs limitations -- ruled out above for the reasons
-   already covered (store + streamed n-gram table both need real O_DIRECT).
+Both need an **elevated PowerShell window** (can't elevate from inside WSL) and **must be redone
+after every `wsl --shutdown` or reboot** -- the mount doesn't persist on its own. Per this
+project's own `qwen38-flash-offload/AGENTS.md` ("ask before ... creating ... a filesystem, which
+erases the drives"), the exact device/VHDX path gets confirmed before any `mkfs`.
 
-Routes 1 and 2 both need an admin PowerShell window and **must be redone after every
-`wsl --shutdown` or reboot** (the mount doesn't persist on its own).
+## Decided (not asking): torch/CUDA toolkit version
+
+Torch `2.13.0+cu130` is already installed on this machine and the 616.56 driver supports it.
+`torch.utils.cpp_extension` refuses to build when `nvcc`'s CUDA major version differs from
+torch's, so the fresh 3.10-3.12 venv should target the same `cu130` wheel, and the toolkit to
+install is **`cuda-toolkit-13-0`** (WSL-Ubuntu repo), not `12-x`. Still needs sudo to install.
+Never install the `cuda` meta-package or any in-WSL `nvidia-driver-*` package -- those break GPU
+passthrough.
 
 ## Next steps (held pending Stuart's input)
 
-1. Is the spare NVMe physically installed in this machine yet, or is there even a free M.2 slot
-   for it -- or would the VHDX-on-D: route (above) be preferable regardless?
-2. Which torch/CUDA combination should the fresh 3.10-3.12 venv target, so the right
-   `cuda-toolkit-1X-Y` apt package (sudo required) gets installed once, not guessed twice?
-3. Once 1+2 are answered: set up the chosen disk route, run
-   `qwen38-flash-offload/scripts/install.sh` to build the native extensions, resolve the real
-   dense-weight footprint by actually downloading and loading the model (the only way to answer
-   the capacity question above), then work through
-   `qwen38-flash-offload/skills/qwen38-offload-setup/SKILL.md` step by step, starting from
+1. Disk route: proceed with the VHDX-on-D: route above, or wait for/install the spare NVMe
+   instead (needs confirming there's a free M.2 slot at all)?
+2. OK to install `cuda-toolkit-13-0` via apt (sudo required)?
+3. Once answered: create/attach the volume, point `HF_HOME` and the model download at it
+   directly (skip D: staging), run `qwen38-flash-offload/scripts/install.sh` to build the native
+   extensions, download+load the model to resolve the real dense-weight footprint (the only way
+   to answer the capacity question above), then work through
+   `qwen38-flash-offload/skills/qwen38-offload-setup/SKILL.md` step by step from
    `profiles/rtx3060-12gb.env`.

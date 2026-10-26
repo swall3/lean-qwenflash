@@ -20,8 +20,10 @@
 #   scripts/run_capped.sh <ram-gb> -- <command> [args...]
 # Example:
 #   set -a; source profiles/rtx3060-12gb.env; set +a
-#   scripts/run_capped.sh 9 -- python3 qwen_server.py --model ./model --store ./store/qwen.bin \
-#       --ram-gb 9 --cache "$QWEN_CACHE_TOKENS" --chunk 8192 --port 30000
+#   scripts/run_capped.sh 20 -- python3 qwen_server.py --model ./model --store ./store/qwen.bin \
+#       --ram-gb 8 --cache "$QWEN_CACHE_TOKENS" --chunk 8192 --port 30000
+# (<ram-gb> here is the whole cgroup's MemoryMax, not --ram-gb's expert-cache size -- give it
+# headroom for python/torch/CUDA/staging on top of the cache; see profiles/rtx3060-12gb.env.)
 set -euo pipefail
 
 RAM_GB="${1:?usage: run_capped.sh <ram-gb> -- <command> [args...]}"
