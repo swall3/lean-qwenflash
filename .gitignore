@@ -3,7 +3,10 @@
 /*
 !/.gitignore
 !/README.md
+!/NOTES-rtx3060.md
 !/media/
+!/scripts/
+!/profiles/
 !/qwen_offload.py
 !/qwen_server.py
 !/infer.py

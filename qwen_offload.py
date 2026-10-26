@@ -45,11 +45,20 @@ def load(model_dir, store, chunk=2048, cache_tokens=16384, ram_gb=6.0, cpu=False
     free, _ = torch.cuda.mem_get_info()
     headroom = max(1_500_000_000, int(total * 0.12))
     budget = max(0, min(free, total) - headroom)
+    # Also bound by the whole-device watchdog (memory_guard.DeviceMemory, QWEN_VRAM_LIMIT_BYTES):
+    # NVML/the watchdog see device-wide usage, so what matters is (already-used + this budget),
+    # not this budget alone. Without this, the two caps can land within a few hundred MB of each
+    # other -- any non-torch allocation (CUDA context growth, another app's VRAM use ticking up)
+    # then trips the watchdog's os._exit(86) even though torch itself stayed under its fraction.
+    vram_limit = int(os.environ.get('QWEN_VRAM_LIMIT_BYTES', '16000000000'))
+    watchdog_margin = 500_000_000
+    used_now = total - free
+    budget = max(0, min(budget, vram_limit - used_now - watchdog_margin))
     fraction = max(0.05, min(0.97, budget / total))
     torch.cuda.set_per_process_memory_fraction(fraction)
     print(f'QWEN_VRAM_BUDGET total={total/1e9:.2f}GB free={free/1e9:.2f}GB '
-          f'headroom={headroom/1e9:.2f}GB fraction={fraction:.3f} '
-          f"arch={os.environ['TORCH_CUDA_ARCH_LIST']}", flush=True)
+          f'headroom={headroom/1e9:.2f}GB vram_limit={vram_limit/1e9:.2f}GB '
+          f'fraction={fraction:.3f} arch={os.environ["TORCH_CUDA_ARCH_LIST"]}', flush=True)
     if os.environ.get('QWEN_EXL3_SOURCE')=='1':
         sys.path.insert(0,str(ROOT/'exllamav3'))
     from exllamav3 import model_init
