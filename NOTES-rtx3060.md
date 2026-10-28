@@ -234,3 +234,9 @@ NEXT: rebuild nv2 ext (rm build/nv2/*.so; rerun install.sh with env), relaunch s
 - Bench script /tmp/bench.sh (may be lost on reboot). Headroom ~1GB under cap; 2000+ risks OOM with desktop (dwm/Discord) VRAM drift. Remaining bottleneck: ~11% of picks go to NVMe (1.5GB/s VHDX).
 - TODO: set QWEN38_EC_MAX_SLOTS=1600 in profiles/rtx3060-12gb.env, commit to rtx3060-uva-patch-buddy.
 
+
+### Context + speed push 2026-10-28 ~09:25
+- cache 16K@1600 slots: ~7.1 tok/s, 10.4GB | 32K@1600: 6.85/7.51/6.60 (avg 7.0), 10.5GB | 64K@1600: DIES at load (VRAM 11.57GB > 11.5GB watchdog) | 64K@1200: 6.65/7.26/6.71 (avg 6.9), 10.2GB.
+- CPU expert tier (QWEN_CPU_TIER=1, env hook added in qwen_server.py, default off): crashes in nv2._selftest, HostArena.view() chunk offset bug (offset 941875200 > buffer 615628800). Not fixed.
+- 20-30 tok/s NOT reached. Upstream gets 20+ with 16GB VRAM / 8GB+ RAM-cache on a 4090/3080L; here ~11% of picks hit NVMe (1.5GB/s VHDX), VRAM holds only ~1200-1600 slots of 24576.
+- Run: /tmp/cycle.sh style: QWEN38_EC_MAX_SLOTS=1200 ... --cache 65536.

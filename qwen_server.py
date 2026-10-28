@@ -46,7 +46,7 @@ def main():
     from qwen_offload import load
     start=time.monotonic()
     model,config,cache,tok,pools,tables,draft_model,draft_cache=load(
-        cli.model,cli.store,cli.chunk,cli.cache,cli.ram_gb,cpu=False,mtp=0,embed_disk=True,cache_quant=4)
+        cli.model,cli.store,cli.chunk,cli.cache,cli.ram_gb,cpu=bool(int(os.environ.get('QWEN_CPU_TIER','0'))),mtp=0,embed_disk=True,cache_quant=4)
     # Reuse the existing HTTP, SSE, disconnect cancellation, sampling and stats implementation.
     spec=importlib.util.spec_from_file_location('qwen_http_backend',ROOT/'qwen38-flash-offload/qwen38/serve.py')
     backend=importlib.util.module_from_spec(spec);spec.loader.exec_module(backend)
