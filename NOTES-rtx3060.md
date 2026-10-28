@@ -226,3 +226,11 @@ NEXT: rebuild nv2 ext (rm build/nv2/*.so; rerun install.sh with env), relaunch s
 - Speed: 200 tokens in 48.6 s = 4.1 tok/s (incl. 60-token prefill), temperature 0. NVMe store read ~1.5 GB/s from the ext4 VHDX.
 - Caveat: only short prompts tested; long-context, concurrency and sustained runs untested. Output includes reasoning_content field.
 
+
+### Tuning results 2026-10-28 ~09:12 (warm, 3 prompts x150 tok, temp 0)
+- QWEN38_EC_MAX_SLOTS=256 (profile default): ~4.7 tok/s, VRAM ~8.0GB
+- =1000: 6.17/6.80/6.31 (avg ~6.4), VRAM 9.3GB
+- =1600: 6.82/7.28/7.18 (avg ~7.1), VRAM 10.4GB (cap 11.5GB). Server running PID 47766 at 1600. ~+50% vs default.
+- Bench script /tmp/bench.sh (may be lost on reboot). Headroom ~1GB under cap; 2000+ risks OOM with desktop (dwm/Discord) VRAM drift. Remaining bottleneck: ~11% of picks go to NVMe (1.5GB/s VHDX).
+- TODO: set QWEN38_EC_MAX_SLOTS=1600 in profiles/rtx3060-12gb.env, commit to rtx3060-uva-patch-buddy.
+
