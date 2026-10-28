@@ -470,6 +470,8 @@ class Nv2:
             if len(res) < n_exp:
                 cold = [x for x in range(self.E) if ks[li * self.E + x] == 0][:n_exp - len(res)]
                 ext().warm_read(torch.tensor([li * self.E + x for x in cold], dtype=torch.int64))
+                st = ext().state()   # refresh: slots of the just-read experts were -1 in the earlier snapshot
+                ks = st[1].numpy()
                 res += cold
                 assert len(res) == n_exp, "Not enough RAM experts for CPU validation"
             for mt in (1, 3):

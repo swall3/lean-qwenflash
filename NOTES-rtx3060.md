@@ -246,3 +246,7 @@ NEXT: rebuild nv2 ext (rm build/nv2/*.so; rerun install.sh with env), relaunch s
 - 09:29 RESULT: 64K ctx @900 slots, nv2.py sel_out/w_out=65536 fix: ~19.7K-token prompt PREFILL SUCCEEDED (first_stream 80s => ~245 tok/s prefill), peak VRAM ~10.4GB (<11.5 cap). Pending: lt_b900.txt full result (decode after long prompt + 3-prompt bench). TODO: commit nv2.py fix (+ profile ctx 65536/slots 900?) and push via gh token trick (branch rtx3060-uva-patch-buddy), then final report: 20-30 tok/s NOT reached (~7 tok/s), context 64K achieved at 900 slots (~6.5 tok/s expected).
 
 - 09:30 FINAL STATE: 64K@900 slots with nv2.py sel_out/w_out=65536 fix: 19.7K-token prompt prefill OK (86s, ~245 tok/s), peak VRAM 10.46GB; decode after: 6.85/6.78 tok/s. Server PID 57116 running (64K ctx, 900 slots, log /tmp/srv_b900.log). nv2.py fix + profile NOT yet committed. 20-30 tok/s NOT reached.
+
+### CPU expert tier 2026-10-28 ~10:25
+- Root cause of the earlier crash: nv2._selftest used a stale ext().state() snapshot after warm_read (slot still -1 -> HostArena.view offset out of range). Fixed by refreshing state after warm_read (nv2.py; backup nv2.py.orig3). Selftest now passes (rel err ~0.1% vs fp64).
+- Result at 64K ctx, 900 slots, QWEN_CPU_TIER=1 (6 CPU threads on cores 2-7, overlapping the 12 reader threads on 2-11): 5.91/6.34/5.91 tok/s (avg ~6.1) vs 6.8 without CPU tier. ~43% of picks go to the CPU lane, but it is slower than the GPU zero-copy path here. Not a win with default thread layout; QWEN_CPU_TIER stays default OFF. Untested: reader/CPU core split tuning.
