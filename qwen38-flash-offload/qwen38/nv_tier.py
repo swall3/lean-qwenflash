@@ -305,7 +305,7 @@ class HostArena:
         self.slot = slot_bytes
         self.n = nslots
         self.cs = chunk_slots
-        self.maps, self.bases = [], []
+        self.maps, self.bases, self.dev_bases = [], [], []
         from exllamav3.ext import exllamav3_ext as ext
         left = nslots
         while left > 0:
@@ -317,11 +317,24 @@ class HostArena:
                 r = torch.cuda.cudart().cudaHostRegister(a, k * slot_bytes, 2)
             assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
             t = torch.frombuffer(mm, dtype=torch.uint8, count=4096)
-            assert ext.pinned_cuda_view(t, dev_idx).data_ptr() == a, "UVA alias != host address"
-            self.maps.append(mm); self.bases.append(a)
+            # NOT just a self-test: HostArena.addr gets published through nv2_host.cpp's set_home() into the
+            # GPU-visible home/pointer tables that exllamav3's fused MoE kernel dereferences directly for
+            # RAM-resident ("zero-copy") experts (see nv2_host.cpp's "device reads home only after ram_res == 1"
+            # comment) -- so this arena genuinely needs BOTH addresses: the host one for CPU-side preadv/memcpy/
+            # cudaMemcpy, and the device one (from pinned_cuda_view, which legitimately differs from the host
+            # address under WDDM -- native Windows, and WSL2's CUDA-on-WDDM path) for whatever gets handed to a
+            # kernel. dev_bases/addr_dev below is that second array; only assert the alias is non-null here.
+            dp = ext.pinned_cuda_view(t, dev_idx).data_ptr()
+            assert dp != 0, f"pinned_cuda_view returned a null device alias ({tag})"
+            self.maps.append(mm); self.bases.append(a); self.dev_bases.append(dp)
             left -= k
         self.addr = np.array([self.bases[s // chunk_slots] + (s % chunk_slots) * slot_bytes for s in range(nslots)],
                              dtype=np.int64)
+        # Device-visible counterpart of .addr, same per-slot offsets against dev_bases instead of bases. Equal to
+        # .addr under native Linux UVA; required separately under WDDM/WSL2 (see the comment above).
+        self.addr_dev = np.array(
+            [self.dev_bases[s // chunk_slots] + (s % chunk_slots) * slot_bytes for s in range(nslots)],
+            dtype=np.int64)
 
     def view(self, s):
         mm = self.maps[s // self.cs]

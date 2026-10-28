@@ -178,3 +178,217 @@ passthrough.
    to answer the capacity question above), then work through
    `qwen38-flash-offload/skills/qwen38-offload-setup/SKILL.md` step by step from
    `profiles/rtx3060-12gb.env`.
+
+## Update 2026-10-28: disk/download/pack all done; first full `qwen_server.py` load attempt --
+
+**new, deeper blocker found, unrelated to anything above.**
+
+Since the "Next steps" above were written, the model was downloaded and the expert store was
+packed (`/mnt/qwenstore/model`, `/mnt/qwenstore/store/qwen.bin`, 46.76 GB, 25,088/25,088 records
+pass the script's own sha256 `verify` mode -- store integrity is not in question). `install.sh`
+has already built the native extensions against `cu130`/`8.6` on this box per the "Decided"
+section above.
+
+First real end-to-end attempt: `scripts/run_capped.sh 20 -- python3 qwen_server.py --model
+/mnt/qwenstore/model --store /mnt/qwenstore/store/qwen.bin --ram-gb 8 --cache 16384 --chunk 8192
+--port 30000` (the exact command this file's own "Usage" block under `profiles/rtx3060-12gb.env`
+recommends). `run_capped.sh`'s cgroup fix worked as documented. The dense model loaded and the
+VRAM pool was built successfully at the 239s mark ("model loaded + VRAM pool built; DONTNEED on 8
+checkpoint files") -- so the capacity question from "What's still unverified" above is
+*answered*: the dense model + KV cache + minimal expert-slot pool DOES fit in the ~8.3 GB real
+budget on this card. That's real progress.
+
+It then crashed immediately after, inside `expert_cache.attach_modules` -> `nv2.attach_pool` ->
+`Nv2.__init__` -> `nv2.py`'s `_mapped()`:
+
+```
+AssertionError: UVA alias != host address
+  at: assert xe.pinned_cuda_view(t[:4096], dev_idx).data_ptr() == a
+```
+
+**This is a real, architectural WSL2/WDDM incompatibility, not a config/flag issue -- confirmed
+by reading the native extension source, not guessed:**
+
+- `exllamav3/exllamav3/exllamav3_ext/cuda_host.cpp`'s own `pinned_cuda_view` doc comment says
+  outright: the CUDA device-side alias of `cudaHostRegister`-pinned memory "\[is\] equal to the
+  host pointer under UVA (Linux desktop), but distinct under WDDM (native Windows, and
+  potentially WSL2), where the host pointer is not usable in kernels and this alias must be
+  passed instead." The function deliberately calls `cudaHostGetDevicePointer` instead of assuming
+  pointer equality, *for exactly this reason*.
+- But the caller (`nv2.py`'s `_mapped()`, and **`nv_tier.py`'s `HostArena.__init__` has the
+  identical assertion at line 320** -- this is not nv2-specific, both of the project's NVMe tiers
+  share the same broken assumption) throws that safety mechanism away: it calls
+  `pinned_cuda_view` only to assert its result equals the raw host `mmap` address, instead of
+  using the returned device pointer. On this box that assert is false: WSL2's CUDA-on-WDDM path
+  behaves like the "distinct" case the extension's own author anticipated, not the "equal" case
+  this script assumes.
+- Switching tiers does not route around it: `qwen_offload.py` hardcodes `QWEN38_NV: '2'`
+  (selecting `nv2.py`), but `QWEN38_NV=1` (the older `nv_tier.py`) would hit the exact same
+  assertion in its own `HostArena`, since both reuse the same pin-and-check pattern.
+
+**Why this isn't a quick patch:** the host-mmap address (`a`/`cbase_addr`) returned by `_mapped()`
+gets used in two different contexts that need two different pointer values once host != device:
+plain Python/`ctypes` writes from this process (fine with the host address), and arguments passed
+into the native `e.init(...)` host-engine extension / embedded into GPU-visible control
+structures that CUDA kernels on `nv2_dev.cu` dereference directly for the NVMe-to-GPU zero-copy
+path (which need the *device* alias instead). Fixing this correctly means threading a second
+pointer value through `nv2.py`/`nv_tier.py` call sites and the native `nv2_host.cpp`/`nv2_dev.cu`
+signatures that currently assume one pointer serves both -- a native-code change to vendored,
+~2-day-old upstream code, not a config flag. Did not attempt that patch blind in this session;
+flagging it as its own scoped task.
+
+**Current state:** server process is not running (crashed, confirmed via `ps aux`, nothing
+orphaned). The expert store itself is fine and verified; the blocker is purely in the
+GPU-offload engine's zero-copy pinned-memory plumbing under WSL2.
+
+Options to take this further, not yet chosen:
+1. Patch `_mapped()` (both copies, in `nv2.py` and `nv_tier.py`'s `HostArena`) to stop asserting
+   equality and instead carry the device pointer separately for whatever gets passed to
+   `e.init(...)`/GPU-visible structures -- requires reading `nv2_host.cpp` and `nv2_dev.cu` to
+   confirm which call sites actually need the device alias vs. the host address, then verifying
+   with the store's own byte-level `cmp` mode (not just "it didn't crash") since a wrong pointer
+   here would silently corrupt served tokens rather than crash cleanly.
+2. File/check upstream (`MaxDevv/lean-qwenflash`) for an existing issue or WDDM-aware branch --
+   given how fast the two README-CLI bugs already found here turned out to have matching
+   upstream issues (#1, #2), this WSL2 pointer assumption may already be reported.
+3. Try running this engine from native Linux instead of WSL2 (bare metal or a VM with GPU
+   passthrough that isn't WDDM-mediated) if one is available -- sidesteps the issue entirely since
+   the UVA-equality assumption is true there.
+
+## Update 2026-10-28 (same day, continued): option 1 applied -- fixed the pointer bug, hit a
+**second, deeper one underneath it**
+
+Patched option 1 above, specifically (not blindly -- read `nv2_host.cpp`/`nv2_dev.cu` first to
+confirm which call sites need which address):
+
+- `nv2.py`'s `_mapped()` now returns `(mm, host_addr, dev_addr, t)` instead of asserting equality.
+  `Nv2.__init__` builds two dicts off it: `self.a` (host addresses -- unchanged, still fed to
+  `e.init(...)`'s native CPU engine, which only ever touches this memory via `preadv`/`memcpy`/
+  `cudaMemcpyAsync`'s host-side argument -- all correct with the host address on every platform)
+  and a new `self.da` (device addresses). Every call site that feeds a raw pointer into a CUDA
+  kernel launch -- `nv_pub`, `nv_step`, `nv_copy`, `nv_combine`, `nv_restore`, `nv_rows_all`, both
+  in `nv2.py` and the two call sites in `expert_cache.py` -- now passes `self.da[...]`/
+  `self.nv2.da[...]` instead of `self.a[...]`. `nv_tier.py`'s `HostArena` assertion was relaxed
+  to a non-null check (its `.addr` list is only ever read by CPU code in this call pattern, so
+  the equality it was asserting was never actually required -- confirmed by tracing every
+  `ram_addr[s]`/`pf_ring_addr[r]` use in `nv2_host.cpp`, all `preadv`/`memcpy`/`cudaMemcpyAsync`
+  host-side args, none inside a kernel launch).
+
+**Result: this fix is confirmed correct as far as it goes.** Relaunched -- model load reached
+and passed the exact point that crashed before (`nv2: control pinned region host=0x73c528430000
+dev=0x209000000 (WDDM/WSL2 alias, not UVA-equal)` -- confirms the divergence is real on this box,
+not theoretical), `Nv2.__init__` completed, the engine's own startup self-check passed with
+all-zero bad counters (`vram_bad: 0, ram_bad: 0, table_bad: 0, ...`), `QWEN_SERVER_LOADED`
+printed at 35.9s, and the server actually came up and listened on `127.0.0.1:30000`.
+
+**But the first real `/v1/chat/completions` request crashed the server**, with `GPU assert: an
+illegal memory access was encountered .../coop_autotune.cu 478` -- inside exllamav3's EXL3 GEMM
+kernel autotuner (the quantized-matmul kernel benchmark pass that runs once per unique
+shape/layer, triggered by the model's first real MoE expert computation). Re-ran under
+`compute-sanitizer` (`/usr/local/cuda-13.0/bin/compute-sanitizer --tool memcheck`) to get a real
+backtrace -- **note: device-side instrumentation itself is NOT supported under this WSL2/WDDM
+setup** (`Error: Device not supported` / `Failed to initialize WDDM debugger interface`), but the
+wrapper still caught the host-side CUDA API error and gave a backtrace:
+
+```
+cudaErrorIllegalAddress (error 700) on CUDA API call to cudaFuncSetAttribute
+  set_kernel_attr_once -> measure_stage -> tune -> CoopKernelAutotuner::launch
+  -> exl3_gemm_gr -> exl3_gemm -> BC_LinearEXL3::run_gr -> BC_LinearEXL3::run_alloc
+```
+
+**Important nuance, not yet resolved:** `cudaFuncSetAttribute` failing with "illegal memory
+access" is a classic CUDA symptom of a *sticky context error from an earlier async kernel fault*
+-- once any kernel on a CUDA context triggers an illegal access, every subsequent API call on
+that context returns the same error until the process exits, regardless of what that later call
+actually does. So the real faulting kernel almost certainly ran *before* this GEMM autotune step,
+not inside it. Given the timing (this is the model's very first real forward pass, right after
+the just-fixed nv2 zero-copy pipeline runs its first `nv_copy`/`nv_step`/`nv_pub` kernels to admit
+experts into VRAM), the leading suspect is that the zero-copy *mechanism itself* -- not just the
+pointer value -- may not work correctly under WSL2's WDDM-mediated CUDA stack: i.e. a kernel
+dereferencing `cudaHostGetDevicePointer`'s returned alias may not actually get coherent access to
+the same bytes the CPU side wrote via the host pointer, even though registration succeeds and the
+alias is non-null. Nobody (including this file's 2026-10-26 pinned-memory test) had actually
+verified a *kernel read/write round-trip* through that alias on this box before -- only that
+`cudaHostRegister` succeeds and that the alias is non-null.
+
+**In progress at end of session:** wrote and ran an isolated minimal repro
+(`/tmp/test_zerocopy.py`) -- mmap + `cudaHostRegister(Mapped)` + `cudaHostGetDevicePointer`,
+then a trivial custom kernel that writes a known integer pattern through the device alias, then
+reads it back via the host-side tensor to check the write round-trips. This directly answers
+"does WSL2 support this zero-copy mechanism at all" independent of the rest of the model/nv2
+complexity. Result not yet known when this note was written (JIT compile of the test kernel was
+still running). **Next step for whoever picks this up: check that result first.**
+- If the round trip **works**: the bug is somewhere else in the nv2 pipeline (a pointer I missed,
+  or a synchronization gap between the CPU writer and GPU reader), not the mechanism itself --
+  keep auditing `nv2.py`/`nv2_host.cpp`/`nv2_dev.cu` call sites.
+- If the round trip **fails**: WSL2's CUDA-on-WDDM zero-copy pinned-memory path is genuinely
+  broken or unsupported for kernel-side dereference on this driver/setup, which would mean the
+  nv2 architecture (and the older nv_tier.py tier, which uses the identical mechanism) cannot work
+  under WSL2 at all, regardless of pointer-value fixes -- the real options become running on
+  native Linux (option 3, two updates up) or not using the NVMe zero-copy tier on this box.
+
+## Update 2026-10-28 (same day, resolved): round-trip test passed -- found and fixed the real
+**second bug, server now serves correct output**
+
+The isolated repro (`/tmp/test_zerocopy.py`) came back clean: `host addr=0x7daf59e21000 dev
+addr=0x204c00000` (confirmed genuinely distinct, as expected on WDDM), a trivial kernel wrote a
+known pattern through the device alias, and reading it back via the host-side tensor matched
+exactly -- `ZERO-COPY ROUND TRIP: OK`. **The mechanism itself works fine under WSL2.** That ruled
+out the "WSL2 can't do this at all" theory and pointed back at the nv2 pipeline itself, per the
+first bullet above.
+
+Re-ran the real server with `CUDA_LAUNCH_BLOCKING=1` (forces every kernel launch to be checked
+synchronously, so the error surfaces at its true site instead of a deferred one -- much cheaper
+than `compute-sanitizer`, which isn't usable here anyway: it refused to instrument this GPU under
+WSL2, `Error: Device not supported` / `Failed to initialize WDDM debugger interface`). That
+confirmed the `coop_autotune.cu` errors from the previous update were exactly the deferred/sticky-
+context symptom they looked like: the *real*, synchronous fault was `exl3_moe.cu:571`, inside the
+fused MoE kernel's own launch -- the kernel that reads each selected expert's weight data through
+per-expert pointer tables (`gate_ptrs_trellis`/`up_ptrs_trellis`/`down_ptrs_trellis`, populated
+from the `home` table by `nv_rows_all_k`/`nv_restore_k`).
+
+**Root cause:** the same host/device pointer split from the first bug also applies one level
+down, to `nv_tier.py`'s `HostArena` (the RAM tier of resident experts) -- missed in the first
+pass because `HostArena.addr`'s *direct* uses in `nv2_host.cpp` (preadv targets, `memcpy`,
+`cudaMemcpyAsync`'s host-side argument) are all genuinely correct with the host address. The part
+that was missed: `nv2_host.cpp`'s `set_home(key, ram_addr[s])` -- called at the exact moment a
+RAM slot becomes resident -- publishes that address into the GPU-visible `home` table, and the
+code's own comment already said so outright: `// device reads home only after ram_res == 1`. A
+RAM-resident expert's weights are read by the fused MoE kernel via *direct zero-copy PCIe reads*
+through that published address (this is the whole point of the "RAM tier" -- no explicit copy
+into VRAM), so it needed the device alias, not the host address. Every other `ram_addr[s]` use
+(including the CPU-tier's own direct pointer dereference at two call sites, and the staging
+path's explicit `cudaMemcpyAsync`/`cudaMemcpyDefault` calls) stays correct with the host address.
+
+**Fix applied** (verified, not guessed -- traced every remaining `ram_addr[` use in
+`nv2_host.cpp` individually before concluding only these four needed to change):
+- `nv_tier.py`'s `HostArena` now also computes `self.addr_dev` (device-alias counterpart of
+  `self.addr`, same per-slot layout) alongside the existing host-address array.
+- `nv2.py`'s `e.init(...)` call now passes `self.ram.addr_dev` as a new tensor argument.
+- `nv2_host.cpp`'s `init()` gained a matching `ram_addr_dev` parameter and `Engine::ram_addr_dev`
+  field, and the four `set_home(key, ram_addr[...])` call sites (lines ~296, 396, 751, 1026) were
+  changed to `set_home(key, ram_addr_dev[...])`. (`pf_ring_addr` needed no equivalent change --
+  traced every one of its uses too; it's only ever an explicit `cudaMemcpyAsync` source into VRAM,
+  never published to a GPU-dereferenced table.)
+- The small `qwen38-flash-offload/kernels/nv2` extension (2 files, not the full `exllamav3_ext`)
+  recompiled automatically on next import via torch's JIT `load()` -- no manual rebuild step
+  needed, and it's fast (~tens of seconds, not the multi-minute full-extension rebuild the
+  isolated test script accidentally triggered earlier by not sourcing `TORCH_CUDA_ARCH_LIST`
+  first).
+
+**Verified end to end, not just "didn't crash":** relaunched normally (no `CUDA_LAUNCH_BLOCKING`,
+no sanitizer -- full speed). Load reached `QWEN_SERVER_LOADED` at 74s, server came up on
+`127.0.0.1:30000`, and two real `/v1/chat/completions` requests both returned HTTP 200 with
+**coherent, correct output**: a sensible reasoning trace addressing the actual prompt, and
+`"What is 7 times 6?"` -> `"42"` with `finish_reason: "stop"` (clean completion, not a truncated/
+garbled one). Server stayed alive and responsive across both requests. This is real evidence the
+fix is substantively correct -- wrong pointers here would have produced garbled/incoherent tokens
+(reading garbage expert weight bytes), not fluent, contextually-correct English and the right
+arithmetic answer.
+
+**Current state: the server works.** Left running on `127.0.0.1:30000` per the original ask.
+Everything that was fixed is in this repo's working tree (`nv2.py`, `nv_tier.py`,
+`qwen38-flash-offload/kernels/nv2/nv2_host.cpp`, `expert_cache.py`) -- not yet committed to git if
+this repo tracks changes; check `git status` before assuming it's durable across a fresh clone.
+
+Server process from this session is stopped (confirmed dead, nothing orphaned).
