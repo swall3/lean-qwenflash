@@ -305,7 +305,7 @@ class HostArena:
         self.slot = slot_bytes
         self.n = nslots
         self.cs = chunk_slots
-        self.maps, self.bases = [], []
+        self.maps, self.bases, self.dbases = [], [], []
         from exllamav3.ext import exllamav3_ext as ext
         left = nslots
         while left > 0:
@@ -317,11 +317,13 @@ class HostArena:
                 r = torch.cuda.cudart().cudaHostRegister(a, k * slot_bytes, 2)
             assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
             t = torch.frombuffer(mm, dtype=torch.uint8, count=4096)
-            assert ext.pinned_cuda_view(t, dev_idx).data_ptr() == a, "UVA alias != host address"
+            self.dbases.append(ext.pinned_cuda_view(t, dev_idx).data_ptr())
             self.maps.append(mm); self.bases.append(a)
             left -= k
         self.addr = np.array([self.bases[s // chunk_slots] + (s % chunk_slots) * slot_bytes for s in range(nslots)],
                              dtype=np.int64)
+        self.daddr = np.array([self.dbases[s // chunk_slots] + (s % chunk_slots) * slot_bytes for s in range(nslots)],
+                              dtype=np.int64)
 
     def view(self, s):
         mm = self.maps[s // self.cs]

@@ -72,9 +72,10 @@ def _mapped(nbytes, dev_idx, tag):
         r = torch.cuda.cudart().cudaHostRegister(a, nbytes, 2)
     assert int(r) == 0, f"cudaHostRegister failed ({tag}): {r}"
     t = torch.frombuffer(mm, dtype=torch.uint8, count=nbytes)
-    assert xe.pinned_cuda_view(t[:4096], dev_idx).data_ptr() == a, "UVA alias != host address"
+    # WSL2/WDDM: UVA alias != host address; keep a separate device base for kernel launches
+    d = xe.pinned_cuda_view(t[:4096], dev_idx).data_ptr()
     t.zero_()
-    return mm, a, t
+    return mm, a, t, d
 
 
 class Nv2:
@@ -143,9 +144,10 @@ class Nv2:
         for k, n in lay:
             self.off[k] = off
             off += (n + 4095) // 4096 * 4096
-        self.cmm, self.cbase_addr, self.ct = _mapped(off, dev_idx, "control")
+        self.cmm, self.cbase_addr, self.ct, self.cbase_dev = _mapped(off, dev_idx, "control")
         A = lambda k: self.cbase_addr + self.off[k]
         self.a = {k: A(k) for k, _ in lay}
+        self.ad = {k: self.cbase_dev + self.off[k] for k, _ in lay}
         self.hc = self.ct[self.off["hc"]: self.off["hc"] + HCN * 8].view(torch.int64)
         self.home = self.ct[self.off["home"]: self.off["home"] + self.K * 24].view(torch.int64)
         self.res = self.ct[self.off["res"]: self.off["res"] + self.K * 4].view(torch.int32)
@@ -193,7 +195,7 @@ class Nv2:
         e.init(self.L, self.E, H, self.I, self.rec_bytes, self.slot, int(g("QWEN38_NV_PIECE_KB", "2304")) * 1024,
                pool.off_u, pool.off_d, self.fd, self.ph, self.a["hc"], self.a["req"], self.a["rep"], self.a["wbl"],
                self.a["adml"], self.a["land"], self.a["home"], self.a["res"], self.a["hx"], self.a["hout"],
-               torch.tensor(self.ram.addr.tolist(), dtype=torch.int64), torch.tensor(self.pf.addr.tolist(), dtype=torch.int64),
+               torch.tensor(self.ram.addr.tolist(), dtype=torch.int64), torch.tensor(self.pf.addr.tolist(), dtype=torch.int64), torch.tensor(self.ram.daddr.tolist(), dtype=torch.int64),
                torch.from_numpy(sc), int(g("QWEN38_NV_THREADS", "16")), rcpus, int(g("QWEN38_NV_CTL_CPU", "25")),
                int(self.wb_on), int(g("QWEN38_NV_LAND", "64")), int(g("QWEN38_NV_FREE_LO", "96")),
                torch.tensor(self.vring_addr, dtype=torch.int64))
@@ -207,7 +209,7 @@ class Nv2:
         pool.home = self.home.view(self.L, self.E, 3)
         pool.home_cpu = pool.home
         pool.nv2 = self
-        e.nv_rows_all(self.L, self.E, pool.slotof, self.a["home"], pool.tabs)
+        e.nv_rows_all(self.L, self.E, pool.slotof, self.ad["home"], pool.tabs)
         torch.cuda.synchronize(self.dev)
         if getattr(pool, "ev_ready", None) is not None:
             for ev in pool.ev_ready:
@@ -260,7 +262,7 @@ class Nv2:
             rank += [order[li][r] for li in range(self.L)]
         t = time.perf_counter()
         n1 = ext().warm_read(torch.tensor(rank[:self.nram], dtype=torch.int64))
-        ext().nv_rows_all(self.L, self.E, p.slotof, self.a["home"], p.tabs)
+        ext().nv_rows_all(self.L, self.E, p.slotof, self.ad["home"], p.tabs)
         torch.cuda.synchronize(self.dev)
         NT._log(f"nv2 RAM warm: {n1} experts in {time.perf_counter() - t:.1f} s")
         self._rank = rank
@@ -282,7 +284,7 @@ class Nv2:
             rest = [k for k in rest if ks[k] == 0][: nd]
             if rest:
                 ext().warm_read(torch.tensor(rest, dtype=torch.int64))
-        ext().nv_rows_all(self.L, self.E, p.slotof, self.a["home"], p.tabs)
+        ext().nv_rows_all(self.L, self.E, p.slotof, self.ad["home"], p.tabs)
         torch.cuda.synchronize(self.dev)
         if self.b70:
             ms = ext().b70_attach(self.b70_ring, torch.tensor(self.b70_keys, dtype=torch.int64), 900.0)
@@ -355,15 +357,15 @@ class Nv2:
             npf = bsz * self.pool.mods[li + 1].num_experts_per_tok
             son = p.slotof[li + 1]
         e.nv_pub(s, ww, zp, n, bsz, self.H, li, self.E, p.first, p.slotof[li], 0 if dec else 1, int(send_x),
-                 self.a["hc"], self.a["req"], self.a["hx"], self.dc, self.uidx, self.uexp, self.timeout_ns, pf, npf, son)
+                 self.ad["hc"], self.ad["req"], self.ad["hx"], self.dc, self.uidx, self.uexp, self.timeout_ns, pf, npf, son)
         so, wo = self.sel_out[:n], self.w_out[:n]
-        e.nv_step(s, ww, so, wo, n, p.first, li, self.E, p.S, int(dec), p.slotof, self.a["home"], self.a["res"], p.tabs,
+        e.nv_step(s, ww, so, wo, n, p.first, li, self.E, p.S, int(dec), p.slotof, self.ad["home"], self.ad["res"], p.tabs,
                   p.owner, p.refb, p.pin, p.ctl, p.jobs, self.jobx, self.jobnv, self.dstats, p.cbase.data_ptr(), p.spc,
-                  p.rec, p.off_u, p.off_d, self.a["hc"], self.a["rep"], self.dc, self.uidx, self.ulane, self.a["wbl"],
-                  self.a["adml"], self.a["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg)
-        e.nv_copy(p.ctl, p.jobs, self.jobx, self.jobnv, li, self.E, self.a["home"], self.a["res"], p.cbase.data_ptr(), p.spc,
+                  p.rec, p.off_u, p.off_d, self.ad["hc"], self.ad["rep"], self.dc, self.uidx, self.ulane, self.ad["wbl"],
+                  self.ad["adml"], self.ad["land"], self.dflag, self.timeout_ns, int(self.wb_on), self.dbg)
+        e.nv_copy(p.ctl, p.jobs, self.jobx, self.jobnv, li, self.E, self.ad["home"], self.ad["res"], p.cbase.data_ptr(), p.spc,
                   p.rec, p.sg, p.su, p.sd, p.off_u, p.off_d, self.ram_addr_dev, self.dc, self.uexp, self.ulane, p.slotof,
-                  p.tabs, self.ph, self.a["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg)
+                  p.tabs, self.ph, self.ad["hc"], self.timeout_ns, self.dstats, self.grid, self.dbg)
         self.st["dec_calls" if dec else "small_calls"] += 1
         return so.view(sel.shape), wo.view(w.shape), send_x
 
@@ -412,7 +414,7 @@ class Nv2:
 
     def combine(self, fhs):
         f = fhs if fhs.is_contiguous() else fhs.contiguous()
-        ext().nv_combine(f, self.dflag, self.a["hc"] + 6 * 8, self.a["hout"], self.dstats, self.a["hc"], self.timeout_ns)
+        ext().nv_combine(f, self.dflag, self.ad["hc"] + 6 * 8, self.ad["hout"], self.dstats, self.ad["hc"], self.timeout_ns)
         return f
 
     # ---- CPU tier -------------------------------------------------------------------------------------------------
@@ -433,7 +435,7 @@ class Nv2:
             # The validation warm-read may have duplicated existing GPU experts.
             keys=np.flatnonzero(self.pool.slotof.flatten().cpu().numpy()>=0).astype(np.int64)
             ext().drop_keys(torch.from_numpy(keys))
-            ext().nv_rows_all(self.L,self.E,self.pool.slotof,self.a['home'],self.pool.tabs)
+            ext().nv_rows_all(self.L,self.E,self.pool.slotof,self.ad['home'],self.pool.tabs)
         self.set_cpu(True, nvcpu=True)
 
     def cpu_setup(self):

@@ -542,7 +542,7 @@ class Pool:
         b, idx = self.staged.pop(li)
         hot=getattr(self,'stage_hot',{}).pop(li,None)
         if hot is None or not len(hot):
-            nv2.ext().nv_restore(idx, li, self.E, self.nv2.a["home"], self.tabs)
+            nv2.ext().nv_restore(idx, li, self.E, self.nv2.ad["home"], self.tabs)
             return
         # The preceding MoE has consumed this layer's staging buffer. Admit its
         # highest-frequency experts directly, before that buffer is reused.
@@ -559,7 +559,7 @@ class Pool:
         keys=np.flatnonzero(self.slot_np.reshape(-1)>=0).astype(np.int64)
         nv2.ext().drain_all()
         nv2.ext().drop_keys(torch.from_numpy(keys))
-        nv2.ext().nv_rows_all(len(self.mods),self.E,self.slotof,self.nv2.a['home'],self.tabs)
+        nv2.ext().nv_rows_all(len(self.mods),self.E,self.slotof,self.nv2.ad['home'],self.tabs)
         self.stage_stats['seed_layers']=self.stage_stats.get('seed_layers',0)+1
         self.stage_stats['seed_candidates']=self.stage_stats.get('seed_candidates',0)+len(hot)
 

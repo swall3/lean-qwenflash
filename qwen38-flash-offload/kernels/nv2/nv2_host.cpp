@@ -164,7 +164,7 @@ struct Engine
     volatile int64_t* hc = nullptr; Req* req = nullptr; Rep* rep = nullptr; LogE* wbl = nullptr; LogE* adml = nullptr;
     int32_t* land = nullptr; volatile int64_t* home = nullptr; volatile int32_t* ram_res = nullptr; uint16_t* hx = nullptr; float* hout = nullptr;
     // RAM tier
-    int nram = 0; std::vector<int64_t> ram_addr;
+    int nram = 0; std::vector<int64_t> ram_addr; std::vector<int64_t> ram_daddr;
     std::vector<int32_t> slot_of; std::vector<int8_t> kst; std::vector<double> karr;
     std::vector<int32_t> owner, pinc, lprev, lnext; int lru_old = -1, lru_new = -1;
     std::vector<int32_t> freel;
@@ -286,7 +286,7 @@ struct Engine
         const int s = take_slot();
         if (s < 0) return false;
         owner[s] = key; slot_of[key] = s; kst[key] = KS_INFLIGHT;
-        set_home(key, ram_addr[s]);                 // device reads home only after ram_res == 1
+        set_home(key, ram_daddr[s]);                 // device reads home only after ram_res == 1
         const double t = now_ms();
         const double start = std::max(t, nv_free_at);
         double svc = pol.nvdeep;
@@ -386,7 +386,7 @@ struct Engine
                 std::lock_guard<std::mutex> lk(mu);
                 if (kst[w.key] == KS_RES && slot_of[w.key] == w.s && kvr[w.key] == w.v)
                 {
-                    set_home(w.key, ram_addr[w.s]);
+                    set_home(w.key, ram_daddr[w.s]);
                     kvr[w.key] = -1;
                     C.wb_landed++;
                 }
@@ -741,7 +741,7 @@ struct Engine
                     {
                         e->owner[s] = entry.key; e->slot_of[entry.key] = s;
                         e->kst[entry.key] = KS_INFLIGHT;
-                        e->set_home(entry.key, e->ram_addr[s]);
+                        e->set_home(entry.key, e->ram_daddr[s]);
                     }
                 }
             }
@@ -899,7 +899,7 @@ static void segv_handler(int sig, siginfo_t* si, void* uc)
 
 void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t slot_bytes, int64_t piece, int64_t off_u,
           int64_t off_d, int64_t fd, int64_t ph, int64_t hc, int64_t req, int64_t rep, int64_t wbl, int64_t adml, int64_t land,
-          int64_t home, int64_t ram_res, int64_t hx, int64_t hout, at::Tensor ram_addr, at::Tensor pf_ring, at::Tensor score,
+          int64_t home, int64_t ram_res, int64_t hx, int64_t hout, at::Tensor ram_addr, at::Tensor pf_ring, at::Tensor ram_daddr, at::Tensor score,
           int64_t readers, std::vector<int64_t> reader_cpus, int64_t ctl_cpu, int64_t exclusive, int64_t land_target, int64_t free_lo,
           at::Tensor vring)
 {
@@ -918,6 +918,7 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     e.hx = (uint16_t*) hx; e.hout = (float*) hout;
     e.nram = int(ram_addr.numel());
     e.ram_addr.assign(ram_addr.data_ptr<int64_t>(), ram_addr.data_ptr<int64_t>() + e.nram);
+    e.ram_daddr.assign(ram_daddr.data_ptr<int64_t>(), ram_daddr.data_ptr<int64_t>() + e.nram);
     e.pf_ring_addr.assign(pf_ring.data_ptr<int64_t>(), pf_ring.data_ptr<int64_t>() + pf_ring.numel());
     e.pf_ev.resize(e.pf_ring_addr.size()); e.pf_ev_pending.assign(e.pf_ring_addr.size(), 0);
     for (auto& ev : e.pf_ev) cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
@@ -1013,7 +1014,7 @@ int64_t wb_bulk(at::Tensor keys, at::Tensor src)
     std::lock_guard<std::mutex> lk(e.mu);
     for (auto& [key, s] : done)
     {
-        e.slot_of[key] = s; e.kst[key] = KS_RES; e.lru_push_new(s); e.set_home(key, e.ram_addr[s]);
+        e.slot_of[key] = s; e.kst[key] = KS_RES; e.lru_push_new(s); e.set_home(key, e.ram_daddr[s]);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         __atomic_store_n(&e.ram_res[key], 1, __ATOMIC_RELEASE);
     }

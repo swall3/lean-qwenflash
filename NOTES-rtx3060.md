@@ -178,3 +178,51 @@ passthrough.
    to answer the capacity question above), then work through
    `qwen38-flash-offload/skills/qwen38-offload-setup/SKILL.md` step by step from
    `profiles/rtx3060-12gb.env`.
+
+## 2026-10-28 session notes (WSL2 UVA finding + option 2 patch work)
+
+- Mount: `/mnt/qwenstore` is ext4 on D:\wsl-disks\qwen-store.vhdx. Re-attach after wsl --shutdown:
+  powershell.exe wsl.exe --mount --vhd D:\wsl-disks\qwen-store.vhdx --bare ; then
+  /mnt/c/Windows/System32/wsl.exe -u root -e bash -c 'mount -o noatime LABEL=qwenstore /mnt/qwenstore' (root via wsl.exe works, no sudo password needed).
+- CUDA 13.0 toolkit installed; native exts built in qwen38-flash-offload/build/*. Build/run needs
+  CUDA_HOME=/usr/local/cuda-13.0 and PATH including .venv/bin (ninja). First server start compiles ~190 exllamav3 kernels (~20 min), now cached.
+- Model (80G) + store (44G, qwen.bin) done. Load = 93 s, VRAM ~7GB transient.
+- Launch: set -a; . profiles/rtx3060-12gb.env; set +a; scripts/run_capped.sh 26 -- python3 qwen_server.py --model /mnt/qwenstore/model --store /mnt/qwenstore/store/qwen.bin --ram-gb 12 --cache 16384 --chunk 4096 --port 30000
+- FAILURE on WSL2: AssertionError "UVA alias != host address" (nv2.py:75 _mapped; nv_tier.py:320 HostArena). cudaHostRegister(Mapped) succeeds but
+  exllamav3 pinned_cuda_view returns a device ptr != host ptr (host 0x7b40.. -> dev 0x204c00000). WDDM/WSL2 has no identity UVA. Verified with /tmp/uva_test.py.
+- Patch plan (option 2, Stuart chose): host addrs (nv2.py cbase_addr/self.a[*], ram.addr, pf.addr) are passed to device kernels (nv2_dev.cu) and host engine (nv2_host.cpp).
+  Need a separate device-address for each pinned region (cudaHostGetDevicePointer == pinned_cuda_view(t).data_ptr()) while host threads keep host addr.
+
+
+### Patch scoping (option 2) - 2026-10-28
+Root: qwen38-flash-offload/. Device kernels dereference HOST pointers directly (assume UVA identity). Needed split: host addr (CPU threads, memcpy, O_DIRECT reads) vs device addr (kernels).
+Sites:
+ - nv2.py _mapped(): drop the identity assert; return (mm, host_addr, tensor, dev_addr=pinned_cuda_view(t).data_ptr()) -> delta = dev - host per region.
+ - nv2.py L146-147: self.a[k]=cbase_addr+off -> keep host dict self.a (for e.init host engine) AND new self.ad (device addrs) used for ALL kernel launches: nv_rows_all, nv_step, nv_copy(home,res), nv_restore (expert_cache.py L545), nv_combine, etc. (lines ~210,263,285,360 + expert_cache.py).
+ - nv_tier.py HostArena (L305-325): per-chunk dev base; expose .addr (host) and .daddr (device) arrays. Remove identity assert.
+ - kernels/nv2/nv2_host.cpp: set_home(key,a) writes into 'home' table which DEVICE reads (nv2_dev.cu home_all[key*3..]) -> must store DEVICE addr of slot (host ram_addr[s] + per-chunk delta). Lines 234,289,389,744,1016 call set_home(ram_addr[s]); engine init needs a parallel ram_daddr vector.
+ - nv2_dev.cu nv_copy_k L410: s_wb = ram_addr[jobx[j]] (device-side tensor of RAM slot addrs, passed from python) -> must be device addrs. ram_addr_dev in nv2.py ~L172 / nv_copy arg.
+ - nv2_host.cpp host-side uses of ram_addr (memcpy L750, cudaMemcpyAsync L378/1008, rd.submit reads L297) stay HOST addr. cudaMemcpyAsync with host-registered ptr is fine.
+ - Region layout structs (Req/Rep/etc in control region) are accessed by host threads via host ptr and kernels via device ptr -> fine once two bases passed.
+Uncertain: whether mapped zero-copy reads from kernels perform OK on WDDM (test needed).
+
+
+### Patch plan v2 (exact) 2026-10-28
+- nv2.py: _mapped returns dev base too (pinned_cuda_view(t).data_ptr()); new self.ad = {k: dev_base+off[k]}; keep self.a (host) ONLY for e.init (L194-195). Replace self.a[...] with self.ad[...] in kernel launches: L210,263,285,358-366,415,436 and expert_cache.py L545,562 (nv2.a['home'] -> nv2.ad['home']).
+- nv_tier.HostArena: add self.dbases (dev per chunk) and self.daddr array; remove identity assert.
+- nv2_host.cpp: init() gets extra at::Tensor ram_daddr; Engine.ram_daddr vector; set_home(key, ram_addr[s]) at ~L289,389,744,1016 -> ram_daddr[s] (home table is read by DEVICE). set_home(vring_addr) L325 unchanged (already device ptrs). Host memcpy/reads/cudaMemcpyAsync keep host addrs.
+- nv2.py L196 init call: pass torch.tensor(self.ram.daddr.tolist()) as new arg (position after pf_ring).
+- Backups: *.orig next to each patched file. Rebuild nv2 ext: rm build/nv2/*.so, rerun install step (nv2 only).
+
+
+### Patch status 2026-10-28 ~08:55
+APPLIED (backups *.orig in qwen38/ and kernels/nv2/): Python (nv2.py: _mapped returns dev base, self.ad dict used for all kernel launches; expert_cache.py nv2.ad; nv_tier.HostArena dbases/daddr, asserts removed) and C++ nv2_host.cpp (ram_daddr vector, init() takes new ram_daddr tensor AFTER pf_ring, 4 set_home calls use ram_daddr).
+STILL TO CHECK: (1) nv2.py ram_addr_dev/vring: nv_copy_k uses ram_addr[jobx[j]] = vring addrs (device ptrs already, fine). (2) device kernels read 'ph' etc fine. (3) any other kernel that gets HOST addrs of ram slots: expert_cache.py nv_restore/staging (st_ram_src in host cpp L829 uses ram_addr for H2D cudaMemcpyAsync - host ptr OK). (4) nv_tier.py self.ring.addr tolist L636 passed to kernel? check. (5) nv_tier.py L683/nv2.py L587 debug compares home[k,0] != ram.addr -> use daddr (debug only).
+NEXT: rebuild nv2 ext (rm build/nv2/*.so; rerun install.sh with env), relaunch server per launch cmd in notes, watch /tmp/qwen-server.log.
+
+
+### RESULT 2026-10-28 08:56: UVA patch WORKS on WSL2/RTX 3060
+- nv2 engine up, server on :30000, coherent output on 3 prompts. Load ~110 s (cached kernels). VRAM steady ~8.0 GB of 12 GB. RAM tier 6990 slots (12 GiB).
+- Speed: 200 tokens in 48.6 s = 4.1 tok/s (incl. 60-token prefill), temperature 0. NVMe store read ~1.5 GB/s from the ext4 VHDX.
+- Caveat: only short prompts tested; long-context, concurrency and sustained runs untested. Output includes reasoning_content field.
+
