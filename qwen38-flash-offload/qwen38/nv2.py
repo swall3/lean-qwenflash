@@ -180,8 +180,8 @@ class Nv2:
         self.jobx, self.jobnv = D(pool.jobs.numel() // 2), D(pool.jobs.numel() // 2)
         self.dflag, self.dstats = D(1, torch.int64), D(STN, torch.int64)
         self.dbg = D(DBG * 8, torch.int64)
-        self.sel_out = torch.empty(16384, dtype=torch.int64, device=self.dev)
-        self.w_out = torch.empty(16384, dtype=torch.half, device=self.dev)
+        self.sel_out = torch.empty(65536, dtype=torch.int64, device=self.dev)
+        self.w_out = torch.empty(65536, dtype=torch.half, device=self.dev)
         # ---- scores (tie-break: colder first to the CPU)
         sp = g("QWEN38_EC_WARM", "")
         self.scores = json.load(open(sp)) if sp else {}

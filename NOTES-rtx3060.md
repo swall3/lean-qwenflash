@@ -240,3 +240,9 @@ NEXT: rebuild nv2 ext (rm build/nv2/*.so; rerun install.sh with env), relaunch s
 - CPU expert tier (QWEN_CPU_TIER=1, env hook added in qwen_server.py, default off): crashes in nv2._selftest, HostArena.view() chunk offset bug (offset 941875200 > buffer 615628800). Not fixed.
 - 20-30 tok/s NOT reached. Upstream gets 20+ with 16GB VRAM / 8GB+ RAM-cache on a 4090/3080L; here ~11% of picks hit NVMe (1.5GB/s VHDX), VRAM holds only ~1200-1600 slots of 24576.
 - Run: /tmp/cycle.sh style: QWEN38_EC_MAX_SLOTS=1200 ... --cache 65536.
+
+- 09:26 FINDING: long prompt (~20K tok, chunk 4096) at 64K ctx fails in PREFILL: nv2.py:370 layer(): RuntimeError shape '[4096,10]' invalid for input of size 16384 (nv_step MAXU/sel_out buffer sel_out=16384 elements in nv2.py; chunk 4096 tokens x top10=40960 > 16384). Short-prompt (60 tok) fine. Fix idea: use --chunk 1024 (1024*10=10240<=16384) or enlarge sel_out/w_out buffers (nv2.py ~L178 torch.empty(16384)). Earlier 64K@1200 kill = VRAM watchdog 11.55>11.5GB during prefill. Server state: /tmp/longtest.sh a900 loop may still be running qwen_server PID 56076 (64K@900). 20-30 tok/s unreachable.
+
+- 09:29 RESULT: 64K ctx @900 slots, nv2.py sel_out/w_out=65536 fix: ~19.7K-token prompt PREFILL SUCCEEDED (first_stream 80s => ~245 tok/s prefill), peak VRAM ~10.4GB (<11.5 cap). Pending: lt_b900.txt full result (decode after long prompt + 3-prompt bench). TODO: commit nv2.py fix (+ profile ctx 65536/slots 900?) and push via gh token trick (branch rtx3060-uva-patch-buddy), then final report: 20-30 tok/s NOT reached (~7 tok/s), context 64K achieved at 900 slots (~6.5 tok/s expected).
+
+- 09:30 FINAL STATE: 64K@900 slots with nv2.py sel_out/w_out=65536 fix: 19.7K-token prompt prefill OK (86s, ~245 tok/s), peak VRAM 10.46GB; decode after: 6.85/6.78 tok/s. Server PID 57116 running (64K ctx, 900 slots, log /tmp/srv_b900.log). nv2.py fix + profile NOT yet committed. 20-30 tok/s NOT reached.
